@@ -1,0 +1,56 @@
+services:
+  # Optional: Redis container (commented out - using host Redis instead)
+  # Uncomment this if you want to use containerized Redis instead of host Redis
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: exchange-redis
+  #   ports:
+  #     - "${REDIS_HOST_PORT:-6380}:6379"
+  #   volumes:
+  #     - redis-data:/data
+  #   command: redis-server --appendonly yes
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #   networks:
+  #     - exchange-network
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: exchange-app
+    # depends_on removed - connecting to host Redis instead
+    environment:
+      # Use host.docker.internal to access host machine's Redis on port 6379
+      - REDIS_HOST=${REDIS_HOST:-host.docker.internal}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - REDIS_DB=${REDIS_DB:-0}
+      # HTTP server port
+      - PORT=${PORT:-8003}
+      # Set timezone to HCMC/Bangkok (UTC+7)
+      - TZ=Asia/Ho_Chi_Minh
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8003}:8003"
+    networks:
+      - exchange-network
+    # Add extra_hosts for Windows/Mac Docker Desktop to access host
+    # This ensures host.docker.internal resolves correctly
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # DNS configuration to help with hostname resolution
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+
+# volumes:
+#   redis-data:
+#     driver: local
+
+networks:
+  exchange-network:
+    driver: bridge
