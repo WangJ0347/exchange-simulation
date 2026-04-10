@@ -1,6 +1,7 @@
 package exchange
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"strings"
@@ -59,17 +60,88 @@ type OrderBookManager struct {
 	tickerOrders map[string]map[string]struct{} // ticker -> set of orderIDs (reverse index for fast market close)
 	redisClient  *redis.Client
 	mu           sync.RWMutex // Protects orderbooks, orderMeta, and tickerOrders maps
-	// Removed: tickerLocks - no longer needed with FIFO queue
+
+	redisCtx          context.Context
+	redisCtxMu        sync.RWMutex
+	orderStateCache   map[string]*OrderState
+	orderStateCacheMu sync.RWMutex
+	flushCh           chan OrderState
+	flushClose        chan struct{}
+	flushStopOnce     sync.Once
+	flushWG           sync.WaitGroup
 }
 
 // NewOrderBookManager creates a new OrderBookManager
 func NewOrderBookManager(redisClient *redis.Client) *OrderBookManager {
-	return &OrderBookManager{
-		orderbooks:   make(map[string]*OrderBook),
-		orderMeta:    make(map[string]*OrderMetadata),
-		tickerOrders: make(map[string]map[string]struct{}),
-		redisClient:  redisClient,
+	m := &OrderBookManager{
+		orderbooks:      make(map[string]*OrderBook),
+		orderMeta:       make(map[string]*OrderMetadata),
+		tickerOrders:    make(map[string]map[string]struct{}),
+		redisClient:     redisClient,
+		redisCtx:        context.Background(),
+		orderStateCache: make(map[string]*OrderState),
+		flushCh:         make(chan OrderState, 4096),
+		flushClose:      make(chan struct{}),
 	}
+	m.flushWG.Add(1)
+	go m.redisFlushWorker()
+	return m
+}
+
+// SetRedisContext sets the context used for Redis operations (e.g. shutdown timeout).
+func (m *OrderBookManager) SetRedisContext(ctx context.Context) {
+	m.redisCtxMu.Lock()
+	defer m.redisCtxMu.Unlock()
+	if ctx != nil {
+		m.redisCtx = ctx
+	}
+}
+
+func (m *OrderBookManager) redisOpCtx() context.Context {
+	m.redisCtxMu.RLock()
+	c := m.redisCtx
+	m.redisCtxMu.RUnlock()
+	if c != nil {
+		return c
+	}
+	return context.Background()
+}
+
+// LPCancelTarget is a single LP order to cancel via the per-ticker queue.
+type LPCancelTarget struct {
+	Ticker       string
+	OrderID      string
+	OrderGroupID string
+	Remark       string
+}
+
+// CollectLPCancelTargets returns LP orders for queue-based cancellation (read-only snapshot).
+func (m *OrderBookManager) CollectLPCancelTargets() []LPCancelTarget {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]LPCancelTarget, 0)
+	for orderID, meta := range m.orderMeta {
+		if isLiquidityProviderOrder(meta.Remark) {
+			out = append(out, LPCancelTarget{
+				Ticker:       meta.Ticker,
+				OrderID:      orderID,
+				OrderGroupID: meta.OrderGroupID,
+				Remark:       meta.Remark,
+			})
+		}
+	}
+	return out
+}
+
+// SnapshotTickersFromOrderbooks returns tickers that currently have an in-memory order book.
+func (m *OrderBookManager) SnapshotTickersFromOrderbooks() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]string, 0, len(m.orderbooks))
+	for t := range m.orderbooks {
+		out = append(out, t)
+	}
+	return out
 }
 
 // getOrderbook gets or creates an orderbook for a ticker
@@ -101,7 +173,7 @@ func (m *OrderBookManager) getOrderbook(ticker string) *OrderBook {
 func (m *OrderBookManager) GetOrderState(ticker, remark, orderGroupID string) (*OrderState, error) {
 	key := ticker + "_orders"
 	internalOrderID := ExtractInternalOrderID(remark, orderGroupID)
-	orderJSON, err := m.redisClient.HGet(ctx, key, internalOrderID).Result()
+	orderJSON, err := m.redisClient.HGet(m.redisOpCtx(), key, internalOrderID).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -110,26 +182,34 @@ func (m *OrderBookManager) GetOrderState(ticker, remark, orderGroupID string) (*
 	return &state, err
 }
 
-// GetExchangeOrderState retrieves order state from exchange's own Redis cache using orderID
+// GetExchangeOrderState retrieves order state from in-memory cache or exchange Redis hash.
 func (m *OrderBookManager) GetExchangeOrderState(ticker, orderID string) (*OrderState, error) {
+	if st, ok := m.cacheGetOrderState(ticker, orderID); ok {
+		return st, nil
+	}
 	key := ticker + "_exchangeOrders"
-	orderJSON, err := m.redisClient.HGet(ctx, key, orderID).Result()
+	orderJSON, err := m.redisClient.HGet(m.redisOpCtx(), key, orderID).Result()
 	if err != nil {
 		return nil, err
 	}
 	var state OrderState
 	err = json.Unmarshal([]byte(orderJSON), &state)
-	return &state, err
+	if err != nil {
+		return nil, err
+	}
+	m.cachePutOrderState(&state)
+	return &state, nil
 }
 
-// UpdateExchangeOrderState updates order state in exchange's own Redis cache
+// UpdateExchangeOrderState updates exchange Redis hash and the in-memory cache (synchronous HSET only; no stream).
 func (m *OrderBookManager) UpdateExchangeOrderState(state OrderState) error {
+	m.cachePutOrderState(&state)
 	key := state.Ticker + "_exchangeOrders"
 	orderJSON, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}
-	return m.redisClient.HSet(ctx, key, state.OrderID, string(orderJSON)).Err()
+	return m.redisClient.HSet(m.redisOpCtx(), key, state.OrderID, string(orderJSON)).Err()
 }
 
 // StreamOrderUpdate publishes order update to eqtOrder or fnoOrder stream
@@ -138,6 +218,8 @@ func (m *OrderBookManager) StreamOrderUpdate(state OrderState) error {
 	if isLiquidityProviderOrder(state.Remark) {
 		return nil
 	}
+
+	m.cachePutOrderState(&state)
 
 	streamName := "eqtOrder"
 	if isFuturesOrder(state.Ticker) {
@@ -164,7 +246,7 @@ func (m *OrderBookManager) StreamOrderUpdate(state OrderState) error {
 		return err
 	}
 
-	_, err = m.redisClient.XAdd(ctx, &redis.XAddArgs{
+	_, err = m.redisClient.XAdd(m.redisOpCtx(), &redis.XAddArgs{
 		Stream: streamName,
 		Values: map[string]interface{}{
 			"order": string(protoBytes),
@@ -242,79 +324,20 @@ func (m *OrderBookManager) streamMatchedOrders(done []*Order, partial *Order, pa
 		return
 	}
 
-	// Pipeline all GetExchangeOrderState calls (using orderID directly)
-	stateCmds := make([]*redis.StringCmd, len(ordersToProcess))
-	_, err := m.redisClient.Pipelined(ctx, func(pipe redis.Pipeliner) error {
-		for i, orderInfo := range ordersToProcess {
-			key := orderInfo.meta.Ticker + "_exchangeOrders"
-			stateCmds[i] = pipe.HGet(ctx, key, orderInfo.order.ID())
-		}
-		return nil
-	})
-
-	if err != nil {
-		log.Printf("Error executing pipeline for order states: %v", err)
-		// Fallback to individual calls
-		for _, orderInfo := range ordersToProcess {
-			state, err := m.GetExchangeOrderState(orderInfo.meta.Ticker, orderInfo.order.ID())
-			if err != nil {
-				log.Printf("Error getting order state for matched order %s: %v", orderInfo.order.ID(), err)
-				continue
-			}
-
-			// Calculate and update state
-			newFilledQty := state.FilledQty + orderInfo.fillQty
-			newAvgPrice := CalculateAvgPrice(state.AvgPrice, state.FilledQty, orderInfo.fillPrice, orderInfo.fillQty)
-			state.FilledQty = newFilledQty
-			state.AvgPrice = newAvgPrice
-			state.PendingQty = state.Qty - newFilledQty
-
-			// Validate state
-			if state.PendingQty < 0 {
-				state.PendingQty = 0
-				state.FilledQty = state.Qty
-			}
-			if state.FilledQty > state.Qty {
-				state.FilledQty = state.Qty
-				state.PendingQty = 0
-			}
-
-			state.UpdateStatus()
-
-			// Update exchange cache
-			if err := m.UpdateExchangeOrderState(*state); err != nil {
-				log.Printf("Error updating exchange order state: %v", err)
-			}
-
-			// Stream update
-			m.StreamOrderUpdate(*state)
-		}
-		return
-	}
-
-	// Process results and prepare states for streaming
-	var statesToStream []OrderState
-	for i, orderInfo := range ordersToProcess {
-		orderJSON, err := stateCmds[i].Result()
+	// Load state from in-memory cache or Redis, apply fill, then async HSET+XADD via flush worker.
+	for _, orderInfo := range ordersToProcess {
+		state, err := m.GetExchangeOrderState(orderInfo.meta.Ticker, orderInfo.order.ID())
 		if err != nil {
 			log.Printf("Error getting order state for matched order %s: %v", orderInfo.order.ID(), err)
 			continue
 		}
 
-		var state OrderState
-		if err := json.Unmarshal([]byte(orderJSON), &state); err != nil {
-			log.Printf("Error unmarshaling order state for %s: %v", orderInfo.order.ID(), err)
-			continue
-		}
-
-		// Calculate and update state
 		newFilledQty := state.FilledQty + orderInfo.fillQty
 		newAvgPrice := CalculateAvgPrice(state.AvgPrice, state.FilledQty, orderInfo.fillPrice, orderInfo.fillQty)
 		state.FilledQty = newFilledQty
 		state.AvgPrice = newAvgPrice
 		state.PendingQty = state.Qty - newFilledQty
 
-		// Validate state
 		if state.PendingQty < 0 {
 			state.PendingQty = 0
 			state.FilledQty = state.Qty
@@ -325,76 +348,8 @@ func (m *OrderBookManager) streamMatchedOrders(done []*Order, partial *Order, pa
 		}
 
 		state.UpdateStatus()
-
-		statesToStream = append(statesToStream, state)
-	}
-
-	// Update exchange cache and stream updates
-	if len(statesToStream) > 0 {
-		// Pipeline exchange cache updates
-		_, err = m.redisClient.Pipelined(ctx, func(pipe redis.Pipeliner) error {
-			for _, state := range statesToStream {
-				key := state.Ticker + "_exchangeOrders"
-				orderJSON, _ := json.Marshal(state)
-				pipe.HSet(ctx, key, state.OrderID, string(orderJSON))
-			}
-			return nil
-		})
-
-		if err != nil {
-			log.Printf("Error executing pipeline for exchange cache updates: %v", err)
-			// Fallback to individual calls
-			for _, state := range statesToStream {
-				m.UpdateExchangeOrderState(state)
-			}
-		}
-
-		// Pipeline stream updates (protobuf; order-manager expects proto)
-		_, err = m.redisClient.Pipelined(ctx, func(pipe redis.Pipeliner) error {
-			for _, state := range statesToStream {
-				streamName := "eqtOrder"
-				if isFuturesOrder(state.Ticker) {
-					streamName = "fnoOrder"
-				}
-
-				payload := &pb.OrderResult{
-					OrderID:      state.OrderID,
-					OrderGroupID: state.OrderGroupID,
-					Ticker:       state.Ticker,
-					Bs:           state.BS,
-					Price:        state.Price,
-					Qty:          state.Qty,
-					PendingQty:   state.PendingQty,
-					FilledQty:    state.FilledQty,
-					AvgPrice:     state.AvgPrice,
-					Status:       state.Status,
-					Remark:       state.Remark,
-					TradeTime:    state.TradeTime,
-					ErrorMessage: state.ErrorMessage,
-				}
-				protoBytes, protoErr := proto.Marshal(payload)
-				if protoErr != nil {
-					log.Printf("Error marshaling order state for streaming: %v", protoErr)
-					continue
-				}
-
-				pipe.XAdd(ctx, &redis.XAddArgs{
-					Stream: streamName,
-					Values: map[string]interface{}{
-						"order": string(protoBytes),
-					},
-				})
-			}
-			return nil
-		})
-
-		if err != nil {
-			log.Printf("Error executing pipeline for stream updates: %v", err)
-			// Fallback to individual calls
-			for _, state := range statesToStream {
-				m.StreamOrderUpdate(state)
-			}
-		}
+		m.cachePutOrderState(state)
+		m.enqueueStateFlush(*state)
 	}
 }
 
@@ -1205,27 +1160,22 @@ func (m *OrderBookManager) MatchTradeEvent(ticker, priceStr, volumeStr string, s
 			continue
 		}
 
-		// Get current order state from exchange cache
 		state, err := m.GetExchangeOrderState(meta.Ticker, order.ID())
 		if err != nil {
 			log.Printf("Error getting order state for %s: %v", order.ID(), err)
 			continue
 		}
 
-		// Calculate fill
 		fillQty, _ := order.Quantity().Float64()
 		fillPrice, _ := order.Price().Float64()
 
-		// Recalculate AvgPrice
 		newFilledQty := state.FilledQty + fillQty
 		newAvgPrice := CalculateAvgPrice(state.AvgPrice, state.FilledQty, fillPrice, fillQty)
 
-		// Update state
 		state.FilledQty = newFilledQty
 		state.AvgPrice = newAvgPrice
 		state.PendingQty = state.Qty - newFilledQty
 
-		// Validate state
 		if state.PendingQty < 0 {
 			state.PendingQty = 0
 			state.FilledQty = state.Qty
@@ -1236,14 +1186,8 @@ func (m *OrderBookManager) MatchTradeEvent(ticker, priceStr, volumeStr string, s
 		}
 
 		state.UpdateStatus()
-
-		// Update exchange cache
-		if err := m.UpdateExchangeOrderState(*state); err != nil {
-			log.Printf("Error updating exchange order state: %v", err)
-		}
-
-		// Stream update
-		m.StreamOrderUpdate(*state)
+		m.cachePutOrderState(state)
+		m.enqueueStateFlush(*state)
 	}
 
 	// Handle partial matched opposite-side order (similar to processModify)
@@ -1255,25 +1199,20 @@ func (m *OrderBookManager) MatchTradeEvent(ticker, priceStr, volumeStr string, s
 		if exists {
 			// Skip LP orders - they're not stored in Redis
 			if !isLiquidityProviderOrder(meta.Remark) {
-				// Get current order state from exchange cache
 				state, err := m.GetExchangeOrderState(meta.Ticker, partial.ID())
 				if err != nil {
 					log.Printf("Error getting order state for partial order %s: %v", partial.ID(), err)
 				} else {
-					// Calculate fill from partial order
 					fillQty, _ := partialQty.Float64()
 					fillPrice, _ := partial.Price().Float64()
 
-					// Recalculate AvgPrice
 					newFilledQty := state.FilledQty + fillQty
 					newAvgPrice := CalculateAvgPrice(state.AvgPrice, state.FilledQty, fillPrice, fillQty)
 
-					// Update state
 					state.FilledQty = newFilledQty
 					state.AvgPrice = newAvgPrice
 					state.PendingQty = state.Qty - newFilledQty
 
-					// Validate state
 					if state.PendingQty < 0 {
 						state.PendingQty = 0
 						state.FilledQty = state.Qty
@@ -1284,14 +1223,8 @@ func (m *OrderBookManager) MatchTradeEvent(ticker, priceStr, volumeStr string, s
 					}
 
 					state.UpdateStatus()
-
-					// Update exchange cache
-					if err := m.UpdateExchangeOrderState(*state); err != nil {
-						log.Printf("Error updating exchange order state: %v", err)
-					}
-
-					// Stream update
-					m.StreamOrderUpdate(*state)
+					m.cachePutOrderState(state)
+					m.enqueueStateFlush(*state)
 				}
 			}
 		}
@@ -1300,121 +1233,48 @@ func (m *OrderBookManager) MatchTradeEvent(ticker, priceStr, volumeStr string, s
 	return nil
 }
 
-// HandleMarketClose expires orders and resets orderbooks
-func (m *OrderBookManager) HandleMarketClose() {
-	log.Println("Starting market close task...")
-
-	// Get all tickers with orderbooks
-	m.mu.RLock()
-	tickers := make([]string, 0, len(m.orderbooks))
-	for ticker := range m.orderbooks {
-		tickers = append(tickers, ticker)
-	}
-	m.mu.RUnlock()
-
-	if len(tickers) == 0 {
-		log.Println("No active orderbooks, market close task complete")
-		return
+// processMarketCloseTicker expires Redis-backed orders for one ticker and resets its book.
+// Must run on that ticker's queue goroutine only.
+func (m *OrderBookManager) processMarketCloseTicker(ticker string) {
+	opCtx := m.redisOpCtx()
+	orders, err := m.redisClient.HGetAll(opCtx, ticker+"_exchangeOrders").Result()
+	if err != nil {
+		log.Printf("market close: HGetAll %s: %v", ticker, err)
 	}
 
-	log.Printf("Processing %d tickers for market close", len(tickers))
-
-	for _, ticker := range tickers {
-		// Get all orders from exchange's Redis cache
-		orders, _ := m.redisClient.HGetAll(ctx, ticker+"_exchangeOrders").Result()
-
-		for orderID, orderJSON := range orders {
-			var state OrderState
-			if err := json.Unmarshal([]byte(orderJSON), &state); err != nil {
-				log.Printf("Error unmarshaling order %s: %v", orderID, err)
-				continue
-			}
-
-			// Update status
-			if state.FilledQty == 0 {
-				state.Status = "EXP"
-			} else {
-				state.Status = "PXP"
-			}
-			state.PendingQty = 0
-
-			// Update exchange cache
-			if err := m.UpdateExchangeOrderState(state); err != nil {
-				log.Printf("Error updating exchange order state: %v", err)
-			}
-
-			// Stream update
-			m.StreamOrderUpdate(state)
+	for orderID, orderJSON := range orders {
+		var state OrderState
+		if err := json.Unmarshal([]byte(orderJSON), &state); err != nil {
+			log.Printf("Error unmarshaling order %s: %v", orderID, err)
+			continue
 		}
 
-		// Reset orderbook
-		m.mu.Lock()
-		m.orderbooks[ticker] = NewOrderBook()
-		m.mu.Unlock()
-
-		// Clear order metadata for this ticker
-		m.mu.Lock()
-		// Use reverse index for O(1) lookup instead of O(N) scan
-		if orderSet, exists := m.tickerOrders[ticker]; exists {
-			for orderID := range orderSet {
-				delete(m.orderMeta, orderID)
-			}
-			// Clear the ticker's order set
-			delete(m.tickerOrders, ticker)
+		if state.FilledQty == 0 {
+			state.Status = "EXP"
+		} else {
+			state.Status = "PXP"
 		}
-		m.mu.Unlock()
-	}
+		state.PendingQty = 0
 
-	log.Println("Market close task completed: all orders expired and orderbooks reset")
-}
-
-// CancelAllLPOrders cancels all liquidity provider orders from all orderbooks
-// This should be called on LP service startup to clean up orphaned orders from previous instances
-func (m *OrderBookManager) CancelAllLPOrders() int {
-	log.Println("Scanning for orphaned LP orders to cancel...")
-
-	m.mu.RLock()
-	// Collect all LP order metadata
-	lpOrders := make(map[string]*OrderMetadata) // orderID -> metadata
-	for orderID, meta := range m.orderMeta {
-		if isLiquidityProviderOrder(meta.Remark) {
-			lpOrders[orderID] = meta
+		if err := m.UpdateExchangeOrderState(state); err != nil {
+			log.Printf("Error updating exchange order state: %v", err)
+		}
+		if err := m.StreamOrderUpdate(state); err != nil {
+			log.Printf("Error streaming order update at market close: %v", err)
 		}
 	}
-	m.mu.RUnlock()
 
-	if len(lpOrders) == 0 {
-		log.Println("No orphaned LP orders found")
-		return 0
-	}
-
-	log.Printf("Found %d orphaned LP orders, canceling...", len(lpOrders))
-
-	// Cancel each LP order
-	canceledCount := 0
-	for orderID, meta := range lpOrders {
-		// Get orderbook
-		ob := m.getOrderbook(meta.Ticker)
-
-		// Check if order exists in orderbook
-		order := ob.Order(orderID)
-		if order != nil {
-			// Cancel from orderbook
-			ob.CancelOrder(orderID)
-			canceledCount++
+	m.mu.Lock()
+	m.orderbooks[ticker] = NewOrderBook()
+	if orderSet, exists := m.tickerOrders[ticker]; exists {
+		for orderID := range orderSet {
+			delete(m.orderMeta, orderID)
 		}
-
-		// Remove from metadata and ticker index
-		m.mu.Lock()
-		delete(m.orderMeta, orderID)
-		if m.tickerOrders[meta.Ticker] != nil {
-			delete(m.tickerOrders[meta.Ticker], orderID)
-		}
-		m.mu.Unlock()
+		delete(m.tickerOrders, ticker)
 	}
+	m.mu.Unlock()
 
-	log.Printf("Canceled %d orphaned LP orders", canceledCount)
-	return canceledCount
+	m.cacheInvalidateTicker(ticker)
 }
 
 // RestoreOrderbookState restores pending orders from exchange's Redis cache into the orderbook
@@ -1428,7 +1288,7 @@ func (m *OrderBookManager) RestoreOrderbookState() error {
 	var tickers = make(map[string]bool) // Use map to deduplicate tickers
 
 	for {
-		keys, nextCursor, err := m.redisClient.Scan(ctx, cursor, "*_exchangeOrders", 100).Result()
+		keys, nextCursor, err := m.redisClient.Scan(m.redisOpCtx(), cursor, "*_exchangeOrders", 100).Result()
 		if err != nil {
 			log.Printf("Error scanning Redis keys: %v", err)
 			return err
@@ -1464,9 +1324,9 @@ func (m *OrderBookManager) RestoreOrderbookState() error {
 	// Pipeline all HGetAll calls to reduce round-trips
 	// This reduces N Redis calls to 1 batch operation
 	orderCmds := make([]*redis.StringStringMapCmd, len(tickerList))
-	_, err := m.redisClient.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+	_, err := m.redisClient.Pipelined(m.redisOpCtx(), func(pipe redis.Pipeliner) error {
 		for i, ticker := range tickerList {
-			orderCmds[i] = pipe.HGetAll(ctx, ticker+"_exchangeOrders")
+			orderCmds[i] = pipe.HGetAll(m.redisOpCtx(), ticker+"_exchangeOrders")
 		}
 		return nil
 	})
@@ -1627,6 +1487,8 @@ func (m *OrderBookManager) RestoreOrderbookState() error {
 
 				// Stream update for the restored order
 				m.StreamOrderUpdate(state)
+			} else {
+				m.cachePutOrderState(&state)
 			}
 
 			totalRestored++

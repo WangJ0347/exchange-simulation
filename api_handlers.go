@@ -33,7 +33,7 @@ func HandleEqtSend(queueManager *TickerQueueManager) http.HandlerFunc {
 			Async:   false,
 		}
 
-		result := queueManager.EnqueueRequest(tickerReq)
+		result := queueManager.EnqueueRequestWithContext(r.Context(), tickerReq)
 
 		if err := encodeOrderResult(w, r, result); err != nil {
 			log.Printf("Encode order result: %v", err)
@@ -66,7 +66,7 @@ func HandleEqtModify(queueManager *TickerQueueManager) http.HandlerFunc {
 			Async:   false,
 		}
 
-		result := queueManager.EnqueueRequest(tickerReq)
+		result := queueManager.EnqueueRequestWithContext(r.Context(), tickerReq)
 
 		if err := encodeOrderResult(w, r, result); err != nil {
 			log.Printf("Encode order result: %v", err)
@@ -101,7 +101,7 @@ func HandleEqtCancel(queueManager *TickerQueueManager) http.HandlerFunc {
 			Async:   false,
 		}
 
-		result := queueManager.EnqueueRequest(tickerReq)
+		result := queueManager.EnqueueRequestWithContext(r.Context(), tickerReq)
 
 		if err := encodeOrderResult(w, r, result); err != nil {
 			log.Printf("Encode order result: %v", err)
@@ -138,7 +138,7 @@ func HandleFnoSend(queueManager *TickerQueueManager) http.HandlerFunc {
 			Async:   false,
 		}
 
-		result := queueManager.EnqueueRequest(tickerReq)
+		result := queueManager.EnqueueRequestWithContext(r.Context(), tickerReq)
 
 		if err := encodeOrderResult(w, r, result); err != nil {
 			log.Printf("Encode order result: %v", err)
@@ -171,7 +171,7 @@ func HandleFnoModify(queueManager *TickerQueueManager) http.HandlerFunc {
 			Async:   false,
 		}
 
-		result := queueManager.EnqueueRequest(tickerReq)
+		result := queueManager.EnqueueRequestWithContext(r.Context(), tickerReq)
 
 		if err := encodeOrderResult(w, r, result); err != nil {
 			log.Printf("Encode order result: %v", err)
@@ -204,7 +204,7 @@ func HandleFnoCancel(queueManager *TickerQueueManager) http.HandlerFunc {
 			Async:   false,
 		}
 
-		result := queueManager.EnqueueRequest(tickerReq)
+		result := queueManager.EnqueueRequestWithContext(r.Context(), tickerReq)
 
 		if err := encodeOrderResult(w, r, result); err != nil {
 			log.Printf("Encode order result: %v", err)

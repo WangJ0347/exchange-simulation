@@ -117,8 +117,9 @@ func resetStates(redisClient *redis.Client) {
 func orchestrate(manager *exchange.OrderBookManager, queueManager *exchange.TickerQueueManager, redisClient *redis.Client, done chan struct{}, interrupt <-chan os.Signal) error {
 	log.Println("Starting matching engine orchestrator")
 
-	// Use provided done channel (shared with queue manager)
 	var wg sync.WaitGroup
+	ingressStop := make(chan struct{})
+	var tradeWg sync.WaitGroup
 
 	// Start HTTP server in goroutine
 	router := mux.NewRouter()
@@ -146,11 +147,9 @@ func orchestrate(manager *exchange.OrderBookManager, queueManager *exchange.Tick
 		}
 	}()
 
-	// Start event listeners (now using queue manager)
-	wg.Add(1)
-	go exchange.ListenToTradeEvent(queueManager, redisClient, done, &wg)
+	tradeWg.Add(1)
+	go exchange.ListenToTradeEvent(queueManager, redisClient, ingressStop, done, &tradeWg)
 
-	// Start liquidity provider service (now using queue manager)
 	exchange.StartLiquidityProviderV2(manager, queueManager, redisClient, done, &wg)
 
 	// Wait until 14:50 to run market close task and shutdown
@@ -175,29 +174,32 @@ func orchestrate(manager *exchange.OrderBookManager, queueManager *exchange.Tick
 	case <-timer.C:
 		log.Println("Shutdown time (14:50) reached, running market close task...")
 
-		// CRITICAL: Run market close task and wait for it to complete before shutdown
-		// This ensures all order states are updated before we shut down
-		log.Println("Executing market close task: expiring orders and resetting orderbooks...")
-		manager.HandleMarketClose()
-		log.Println("Market close task completed successfully")
-
-		// Now that market close task is done, gracefully shutdown HTTP server
-		log.Println("Shutting down HTTP server...")
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := server.Shutdown(ctx); err != nil {
+		log.Println("Shutting down HTTP server before market close...")
+		shctx, shcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := server.Shutdown(shctx); err != nil {
 			log.Printf("Error shutting down HTTP server: %v", err)
 		}
+		shcancel()
 
-		// Stop all queue processors before closing done channel
+		log.Println("Stopping trade event ingress...")
+		close(ingressStop)
+		tradeWg.Wait()
+
+		log.Println("Executing market close task via per-ticker queues...")
+		flushCtx, flushCancel := context.WithTimeout(context.Background(), 120*time.Second)
+		manager.SetRedisContext(flushCtx)
+		queueManager.HandleMarketCloseViaQueues()
+		flushCancel()
+		manager.SetRedisContext(context.Background())
+
+		manager.StopRedisFlushWorker()
+
 		log.Println("Stopping all ticker queues...")
 		queueManager.StopAllQueues()
 
-		// Close done channel to stop all goroutines (event listeners)
-		log.Println("Stopping event listeners...")
+		log.Println("Stopping event listeners and LP...")
 		close(done)
 
-		// Wait for goroutines with timeout
 		doneChan := make(chan struct{})
 		go func() {
 			wg.Wait()
@@ -216,30 +218,34 @@ func orchestrate(manager *exchange.OrderBookManager, queueManager *exchange.Tick
 		log.Println("Interrupt received, shutting down orchestrator...")
 		timer.Stop()
 
-		// If interrupt happens at or after 14:50, still run market close task if needed
+		shctx, shcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := server.Shutdown(shctx); err != nil {
+			log.Printf("Error shutting down HTTP server: %v", err)
+		}
+		shcancel()
+
+		close(ingressStop)
+		tradeWg.Wait()
+
 		now := time.Now().In(hcmcLoc)
 		if now.Hour() >= 14 && now.Minute() >= 50 {
 			log.Println("Running market close task before shutdown...")
-			manager.HandleMarketClose()
+			flushCtx, flushCancel := context.WithTimeout(context.Background(), 120*time.Second)
+			manager.SetRedisContext(flushCtx)
+			queueManager.HandleMarketCloseViaQueues()
+			flushCancel()
+			manager.SetRedisContext(context.Background())
 			log.Println("Market close task completed")
 		}
 
-		// Gracefully shutdown HTTP server
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := server.Shutdown(ctx); err != nil {
-			log.Printf("Error shutting down HTTP server: %v", err)
-		}
+		manager.StopRedisFlushWorker()
 
-		// Stop all queue processors before closing done channel
 		log.Println("Stopping all ticker queues...")
 		queueManager.StopAllQueues()
 
-		// Close done channel to stop all goroutines
 		log.Println("Stopping event listeners...")
 		close(done)
 
-		// Wait for goroutines with timeout
 		doneChan := make(chan struct{})
 		go func() {
 			wg.Wait()

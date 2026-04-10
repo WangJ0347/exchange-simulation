@@ -403,8 +403,8 @@ func (lp *LiquidityProviderServiceV2) runTickerRefreshLoop(cfg *TickerRefreshCon
 			// Futures: 3-7 seconds
 			randomSeconds = 3 + rand.Intn(5)
 		} else {
-			// Others: 3–180 seconds
-			randomSeconds = 3 + rand.Intn(178)
+			// Others: 3–300 seconds
+			randomSeconds = 3 + rand.Intn(298)
 		}
 		interval := time.Duration(randomSeconds) * time.Second
 
@@ -651,7 +651,7 @@ func (lp *LiquidityProviderServiceV2) Start() {
 		// CRITICAL: Clean up orphaned LP orders from previous instances first
 		// Without this, orders from crashed/restarted LP services pile up
 		log.Println("Liquidity provider: Cleaning up orphaned orders from previous instances...")
-		canceledCount := lp.manager.CancelAllLPOrders()
+		canceledCount := lp.queueManager.CancelAllLPOrders()
 		if canceledCount > 0 {
 			log.Printf("Liquidity provider: Cleaned up %d orphaned orders", canceledCount)
 		}

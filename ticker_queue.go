@@ -1,9 +1,16 @@
 package exchange
 
 import (
+	"context"
 	"log"
+	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	defaultEnqueueWaitTimeout = 45 * time.Second
+	enqueueSendWaitTimeout    = 60 * time.Second
 )
 
 // TickerRequest represents a request to be processed for a specific ticker
@@ -73,58 +80,141 @@ func (tqm *TickerQueueManager) getOrCreateQueue(ticker string) chan TickerReques
 	return queue
 }
 
-// EnqueueRequest enqueues a request for processing
+// EnqueueRequest enqueues a request for processing (blocks until a queue slot is available, up to enqueueSendWaitTimeout).
 func (tqm *TickerQueueManager) EnqueueRequest(req TickerRequest) OrderResult {
-	// Get or create queue for this ticker
+	return tqm.EnqueueRequestWithContext(context.Background(), req)
+}
+
+// EnqueueRequestWithContext enqueues like EnqueueRequest but aborts if ctx is canceled.
+func (tqm *TickerQueueManager) EnqueueRequestWithContext(c context.Context, req TickerRequest) OrderResult {
 	reqChan := tqm.getOrCreateQueue(req.Ticker)
 
-	// Create result channel for synchronous response
 	resultChan := make(chan OrderResult, 1)
 	req.ResultChan = resultChan
 
-	// Enqueue request
+	sendTimer := time.NewTimer(enqueueSendWaitTimeout)
+	defer sendTimer.Stop()
+
 	select {
 	case reqChan <- req:
-		// Wait for result
-		select {
-		case result := <-resultChan:
-			return result
-		case <-time.After(30 * time.Second):
-			log.Printf("Timeout waiting for result for ticker %s", req.Ticker)
-			return OrderResult{
-				Ticker:       req.Ticker,
-				Status:       "ERR",
-				ErrorMessage: "Timeout waiting for processing",
-			}
-		}
 	case <-tqm.done:
 		return OrderResult{
 			Ticker:       req.Ticker,
 			Status:       "ERR",
 			ErrorMessage: "Service shutting down",
 		}
-	default:
-		log.Printf("Queue full for ticker %s, dropping request", req.Ticker)
+	case <-c.Done():
 		return OrderResult{
 			Ticker:       req.Ticker,
 			Status:       "ERR",
-			ErrorMessage: "Queue full",
+			ErrorMessage: "Request canceled",
+		}
+	case <-sendTimer.C:
+		log.Printf("Timeout waiting for queue slot for ticker %s", req.Ticker)
+		return OrderResult{
+			Ticker:       req.Ticker,
+			Status:       "ERR",
+			ErrorMessage: "Timeout waiting to enqueue (queue saturated)",
+		}
+	}
+
+	waitTimer := time.NewTimer(defaultEnqueueWaitTimeout)
+	defer waitTimer.Stop()
+
+	select {
+	case result := <-resultChan:
+		return result
+	case <-tqm.done:
+		return OrderResult{
+			Ticker:       req.Ticker,
+			Status:       "ERR",
+			ErrorMessage: "Service shutting down",
+		}
+	case <-c.Done():
+		return OrderResult{
+			Ticker:       req.Ticker,
+			Status:       "ERR",
+			ErrorMessage: "Request canceled",
+		}
+	case <-waitTimer.C:
+		log.Printf("Timeout waiting for result for ticker %s", req.Ticker)
+		return OrderResult{
+			Ticker:       req.Ticker,
+			Status:       "ERR",
+			ErrorMessage: "Timeout waiting for processing",
 		}
 	}
 }
 
-// EnqueueRequestAsync enqueues a request without waiting for result
+// HandleMarketCloseViaQueues runs end-of-day expiry and book reset on each ticker's queue (serialized with trading).
+func (tqm *TickerQueueManager) HandleMarketCloseViaQueues() {
+	log.Println("Starting market close task (per-ticker queues)...")
+	tickers := tqm.manager.SnapshotTickersFromOrderbooks()
+	if len(tickers) == 0 {
+		log.Println("No active orderbooks, market close task complete")
+		return
+	}
+	log.Printf("Processing %d tickers for market close", len(tickers))
+	for _, ticker := range tickers {
+		res := tqm.EnqueueRequestWithContext(context.Background(), TickerRequest{
+			Type:   "MarketClose",
+			Ticker: ticker,
+			Source: "market_close",
+		})
+		if res.Status == "ERR" && res.ErrorMessage != "" {
+			log.Printf("Market close step for %s: %s", ticker, res.ErrorMessage)
+		}
+	}
+	log.Println("Market close task completed: all tickers processed")
+}
+
+// CancelAllLPOrders cancels all LP orders via per-ticker queues (safe concurrent with matching).
+func (tqm *TickerQueueManager) CancelAllLPOrders() int {
+	log.Println("Scanning for orphaned LP orders to cancel...")
+	targets := tqm.manager.CollectLPCancelTargets()
+	if len(targets) == 0 {
+		log.Println("No orphaned LP orders found")
+		return 0
+	}
+	log.Printf("Found %d orphaned LP orders, canceling via queues...", len(targets))
+	canceled := 0
+	for _, t := range targets {
+		res := tqm.EnqueueRequest(TickerRequest{
+			Type:   "Cancel",
+			Ticker: t.Ticker,
+			Request: OrderRequest{
+				OrderID:      t.OrderID,
+				OrderGroupID: t.OrderGroupID,
+				Ticker:       t.Ticker,
+				Remark:       t.Remark,
+			},
+			Source: "lp_bulk_cleanup",
+		})
+		if res.Status == "CAN" {
+			canceled++
+			continue
+		}
+		if res.Status == "ERR" && strings.Contains(res.ErrorMessage, "already removed") {
+			canceled++
+		}
+	}
+	log.Printf("Canceled %d orphaned LP orders (via queue)", canceled)
+	return canceled
+}
+
+// EnqueueRequestAsync enqueues a request without waiting for result (blocks up to enqueueSendWaitTimeout for a slot).
 func (tqm *TickerQueueManager) EnqueueRequestAsync(req TickerRequest) {
 	reqChan := tqm.getOrCreateQueue(req.Ticker)
 	req.Async = true
 
+	sendTimer := time.NewTimer(enqueueSendWaitTimeout)
+	defer sendTimer.Stop()
 	select {
 	case reqChan <- req:
-		// Request enqueued, don't wait for result
 	case <-tqm.done:
 		return
-	default:
-		log.Printf("Queue full for ticker %s, dropping async request", req.Ticker)
+	case <-sendTimer.C:
+		log.Printf("Queue full for ticker %s, async enqueue timed out", req.Ticker)
 	}
 }
 
@@ -221,6 +311,10 @@ func (tqm *TickerQueueManager) handleRequest(ticker string, req TickerRequest) O
 			}
 		}
 		return OrderResult{Status: "OK"}
+
+	case "MarketClose":
+		tqm.manager.processMarketCloseTicker(ticker)
+		return OrderResult{Ticker: ticker, Status: "OK", ErrorMessage: "Market close applied"}
 
 	default:
 		return OrderResult{

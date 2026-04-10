@@ -12,27 +12,33 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// ListenToTradeEvent listens to tradeEvent stream and processes trade events
-func ListenToTradeEvent(queueManager *TickerQueueManager, redisClient *redis.Client, done <-chan struct{}, wg *sync.WaitGroup) {
+// ListenToTradeEvent listens to tradeEvent stream and processes trade events.
+// Close ingressStop to stop reading new events (e.g. before market close) while done is still open for queue workers.
+func ListenToTradeEvent(queueManager *TickerQueueManager, redisClient *redis.Client, ingressStop <-chan struct{}, done <-chan struct{}, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	log.Println("Starting to listen to tradeEvent stream")
 	lastID := "$" // Start from newest messages only
 
-	// Create a cancellable context
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Cancel context when done channel is closed
 	go func() {
-		<-done
-		cancel()
+		select {
+		case <-done:
+			cancel()
+		case <-ingressStop:
+			cancel()
+		}
 	}()
 
 	for {
 		select {
 		case <-done:
 			log.Println("Stopped listening to tradeEvent stream")
+			return
+		case <-ingressStop:
+			log.Println("Ingress stopped, tradeEvent listener exiting")
 			return
 		default:
 		}
@@ -55,6 +61,8 @@ func ListenToTradeEvent(queueManager *TickerQueueManager, redisClient *redis.Cli
 			select {
 			case <-done:
 				return
+			case <-ingressStop:
+				return
 			case <-time.After(1 * time.Second):
 				continue
 			}
@@ -66,6 +74,8 @@ func ListenToTradeEvent(queueManager *TickerQueueManager, redisClient *redis.Cli
 				for _, message := range stream.Messages {
 					select {
 					case <-done:
+						return
+					case <-ingressStop:
 						return
 					default:
 					}
